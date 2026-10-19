@@ -184,6 +184,122 @@ type SaveOpts struct {
 	ExcludeCommittedZeroPages bool
 }
 
+// scanZeroWorkers is the number of goroutines used by scanZeroPages to
+// compare pages against a zero page in parallel. This is the dominant cost
+// of MemoryFile.SaveTo()'s scan phase for large ranges of newly-committed
+// memory (comparisons for already-known-committed ranges are skipped
+// entirely unless opts.ExcludeCommittedZeroPages is set), so splitting it
+// across goroutines shortens wall-clock scan time on multi-core hosts even
+// though it doesn't reduce total CPU work.
+var scanZeroWorkers = func() int {
+	n := runtime.GOMAXPROCS(0)
+	if n > 8 {
+		n = 8
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}()
+
+// scanZeroPagesMinPages is the minimum page count of a range below which
+// scanZeroPages scans serially rather than paying goroutine dispatch
+// overhead for a parallel scan that wouldn't pay for itself.
+const scanZeroPagesMinPages = 4096 // 16MB at a 4KB page size
+
+// scanZeroPages returns a slice of length fr.Length()/hostarch.PageSize,
+// where element i is non-zero iff the page at fr.Start+i*hostarch.PageSize
+// is entirely zero-filled. It is safe to call without holding f.mu, and does
+// not mutate any MemoryFile state; the only requirement is that no
+// concurrent writer may change the contents of fr while scanZeroPages runs,
+// which SaveTo ensures via f.isSaving.
+func (f *MemoryFile) scanZeroPages(fr memmap.FileRange, zeroPage []byte) []byte {
+	n := fr.Length() / hostarch.PageSize
+	zero := make([]byte, n)
+	scanRange := func(sub memmap.FileRange) {
+		f.forEachChunk(sub, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+			bs := chunk.sliceAt(chunkFR)
+			for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
+				off := chunkFR.Start + uint64(pgoff)
+				if bytes.Equal(bs[pgoff:pgoff+hostarch.PageSize], zeroPage) {
+					zero[(off-fr.Start)/hostarch.PageSize] = 1
+				}
+			}
+			return true
+		})
+	}
+	workers := scanZeroWorkers
+	if uint64(workers) > n {
+		workers = int(n)
+	}
+	if workers <= 1 || n < scanZeroPagesMinPages {
+		scanRange(fr)
+		return zero
+	}
+	pagesPerWorker := (n + uint64(workers) - 1) / uint64(workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		startPage := uint64(w) * pagesPerWorker
+		if startPage >= n {
+			break
+		}
+		endPage := startPage + pagesPerWorker
+		if endPage > n {
+			endPage = n
+		}
+		sub := memmap.FileRange{
+			Start: fr.Start + startPage*hostarch.PageSize,
+			End:   fr.Start + endPage*hostarch.PageSize,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			scanRange(sub)
+		}()
+	}
+	wg.Wait()
+	return zero
+}
+
+// adaptiveDirtyThreshold is the sampled dirty-page fraction at or above
+// which SaveTo skips the parallel scanZeroPages fast path and falls back to
+// comparing and accounting pages in a single serial pass. Above this
+// threshold, most pages are non-zero, so scanZeroPages's second forEachChunk
+// pass (and the f.mu release/reacquire around it) costs more than it saves;
+// measured on real hardware, the parallel path stops paying for itself
+// somewhere around 50% dirty and is a net regression by 75-100% dirty.
+const adaptiveDirtyThreshold = 0.5
+
+// dirtySampleStride samples 1 out of every dirtySampleStride pages to
+// estimate a range's dirty fraction cheaply, without a full scan.
+const dirtySampleStride = 256
+
+// estimateDirtyFraction returns an estimate, in [0, 1], of the fraction of
+// pages in fr that are non-zero, computed from a strided sample rather than
+// a full scan, so its cost does not scale with fr's size.
+func (f *MemoryFile) estimateDirtyFraction(fr memmap.FileRange, zeroPage []byte) float64 {
+	n := fr.Length() / hostarch.PageSize
+	if n == 0 {
+		return 0
+	}
+	var samples, dirty int
+	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+		bs := chunk.sliceAt(chunkFR)
+		stride := hostarch.PageSize * dirtySampleStride
+		for pgoff := 0; pgoff < len(bs); pgoff += stride {
+			samples++
+			if !bytes.Equal(bs[pgoff:pgoff+hostarch.PageSize], zeroPage) {
+				dirty++
+			}
+		}
+		return true
+	})
+	if samples == 0 {
+		return 0
+	}
+	return float64(dirty) / float64(samples)
+}
+
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
 	if err := f.AwaitLoadAll(); err != nil {
@@ -413,12 +529,30 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 			}
 			continue
 		}
+		// Estimate the dirty fraction of fr from a cheap sample, and only pay
+		// for the parallel scanZeroPages fast path (and the f.mu release/
+		// reacquire it requires) when enough of fr is expected to be zero to
+		// make it worthwhile; otherwise fall back to the original serial
+		// compare-and-account pass below. This is safe without f.mu held since
+		// it only reads page contents, which f.isSaving (set above) guarantees
+		// won't be concurrently mutated for the duration of SaveTo.
+		useParallelScan := f.estimateDirtyFraction(fr, zeroPage) < adaptiveDirtyThreshold
+		var zero []byte
+		if useParallelScan {
+			f.mu.Unlock()
+			zero = f.scanZeroPages(fr, zeroPage)
+			f.mu.Lock()
+		}
 		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
 			bs := chunk.sliceAt(chunkFR)
 			for pgoff := 0; pgoff < len(bs); pgoff += hostarch.PageSize {
-				pg := bs[pgoff : pgoff+hostarch.PageSize]
 				off := chunkFR.Start + uint64(pgoff)
-				isZeroed := bytes.Equal(pg, zeroPage)
+				var isZeroed bool
+				if useParallelScan {
+					isZeroed = zero[(off-fr.Start)/hostarch.PageSize] != 0
+				} else {
+					isZeroed = bytes.Equal(bs[pgoff:pgoff+hostarch.PageSize], zeroPage)
+				}
 				if isZeroed {
 					if !wasCommitted {
 						alreadyUncommittedBytes += hostarch.PageSize

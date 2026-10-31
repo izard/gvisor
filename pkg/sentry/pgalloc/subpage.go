@@ -38,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 )
 
 // subpageSaveSize is the block size used by subpage saving, or 0 if subpage
@@ -81,6 +82,12 @@ func fullSubpageMask(size uint64) uint64 {
 	return 1<<n - 1
 }
 
+// maxSubpageRuns returns the maximum number of runs of saved blocks in a page,
+// for block size size.
+func maxSubpageRuns(size uint64) int {
+	return int(hostarch.PageSize/size+1) / 2
+}
+
 // forEachSubpageRun calls fn with the [first, end) block indexes of each run
 // of consecutive set bits in mask, in increasing order.
 func forEachSubpageRun(mask uint64, fn func(first, end uint64)) {
@@ -118,9 +125,32 @@ type subpageSeg struct {
 	first int
 }
 
+// newSubpageLayout returns the layout of the committed pages described by pb,
+// whose saved blocks start at pages file offset off, and the pages file offset
+// after them.
+func newSubpageLayout(pb *pgallocpb.MemoryFileMetadataProto, off uint64) (*subpageLayout, uint64, error) {
+	l := &subpageLayout{size: pb.SubpageSize}
+	for _, s := range pb.MemAcct {
+		if !s.KnownCommitted {
+			continue
+		}
+		var err error
+		if off, err = l.addRange(memmap.FileRange{s.Start, s.End}, off, pb.SubpageMasks); err != nil {
+			return nil, 0, err
+		}
+	}
+	if len(l.masks) != len(pb.SubpageMasks) {
+		return nil, 0, fmt.Errorf("%d subpage masks for %d committed pages", len(pb.SubpageMasks), len(l.masks))
+	}
+	return l, off, nil
+}
+
 // addRange appends the committed range fr, whose saved blocks start at pages
 // file offset off, and returns the pages file offset after them.
 func (l *subpageLayout) addRange(fr memmap.FileRange, off uint64, masks []uint64) (uint64, error) {
+	if !fr.WellFormed() || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 || (len(l.segs) != 0 && l.segs[len(l.segs)-1].End > fr.Start) {
+		return 0, fmt.Errorf("invalid committed range %v for subpage saving", fr)
+	}
 	n := int(fr.Length() / hostarch.PageSize)
 	if len(l.masks)+n > len(masks) {
 		return 0, fmt.Errorf("%d subpage masks for at least %d committed pages", len(masks), len(l.masks)+n)

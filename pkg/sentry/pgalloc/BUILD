@@ -168,6 +168,7 @@ go_library(
         "pgalloc.go",
         "pgalloc_unsafe.go",
         "save_restore.go",
+        "subpage.go",
         "unfree_set.go",
         "unwaste_set.go",
     ],
@@ -210,6 +211,7 @@ go_test(
         "pgalloc_64k_test.go",
         "pgalloc_test.go",
         "save_restore_test.go",
+        "subpage_test.go",
     ],
     embed = [":pgalloc"],
     deps = [
@@ -217,6 +219,7 @@ go_test(
         "//pkg/memutil",
         "//pkg/sentry/memmap",
         "//pkg/sentry/state/stateio",
+        "//pkg/timing",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

@@ -488,6 +488,12 @@ type Config struct {
 	// with the SUID/SGID bits set.
 	AllowSUID bool `flag:"allow-suid"`
 
+	// SaveSubpageSize, if non-zero, is the block size in which checkpoints
+	// save the pages of disk-backed memory files (such as overlay filestores),
+	// writing only blocks that contain non-zero bytes. It must be a power of
+	// two of at least 512 that is smaller than the host page size.
+	SaveSubpageSize int `flag:"save-subpage-size"`
+
 	// UseCPUNums causes the sentry to use KVM CPU numbers as CPU numbers in the
 	// sentry. This is necessary to support features like rseq.
 	UseCPUNums bool `flag:"kvm-use-cpu-nums"`

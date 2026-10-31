@@ -1,0 +1,149 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package pgalloc
+
+// Subpage saving.
+//
+// With large host pages (e.g. 64K on arm64), a MemoryFile backing a tmpfs
+// holds every small file in a page of its own, so most of each committed page
+// is zero. When subpage saving is enabled, SaveTo writes only the
+// subpage-sized blocks of each committed page that contain non-zero bytes,
+// and records which blocks were written in the MemoryFile's metadata. LoadFrom
+// reads such pages back block by block; the blocks that were not saved are
+// left zero, as they are in a newly loaded MemoryFile.
+//
+// Subpage saving requires async page saving (a pages file), and only applies
+// to disk-backed MemoryFiles, whose contents are tmpfs data rather than
+// application memory.
+
+import (
+	"bytes"
+	"fmt"
+	"math/bits"
+	"sort"
+
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
+)
+
+// subpageSaveSize is the block size used by subpage saving, or 0 if subpage
+// saving is disabled.
+var subpageSaveSize atomicbitops.Uint64
+
+// SetSubpageSaveSize enables subpage saving with the given block size, or
+// disables it if size is 0. size must be a power of two of at least 512 bytes
+// that is smaller than hostarch.PageSize and divides it into at most 64
+// blocks; otherwise subpage saving is disabled.
+func SetSubpageSaveSize(size uint64) {
+	if size != 0 && !validSubpageSize(size) {
+		log.Warningf("Ignoring invalid subpage save size %d for page size %d", size, hostarch.PageSize)
+		size = 0
+	}
+	subpageSaveSize.Store(size)
+}
+
+func validSubpageSize(size uint64) bool {
+	return size >= 512 && size < hostarch.PageSize && size&(size-1) == 0 && hostarch.PageSize/size <= 64
+}
+
+// subpageMask returns a mask with bit i set if the i-th size-byte block of pg
+// contains a non-zero byte.
+func subpageMask(pg []byte, size uint64, zero []byte) uint64 {
+	var mask uint64
+	for i := uint64(0); i < uint64(len(pg)); i += size {
+		if !bytes.Equal(pg[i:i+size], zero[:size]) {
+			mask |= 1 << (i / size)
+		}
+	}
+	return mask
+}
+
+// fullSubpageMask returns the mask of all size-byte blocks in a page.
+func fullSubpageMask(size uint64) uint64 {
+	n := hostarch.PageSize / size
+	if n == 64 {
+		return ^uint64(0)
+	}
+	return 1<<n - 1
+}
+
+// forEachSubpageRun calls fn with the [first, end) block indexes of each run
+// of consecutive set bits in mask, in increasing order.
+func forEachSubpageRun(mask uint64, fn func(first, end uint64)) {
+	for mask != 0 {
+		first := uint64(bits.TrailingZeros64(mask))
+		n := uint64(bits.TrailingZeros64(^(mask >> first)))
+		fn(first, first+n)
+		if first+n >= 64 {
+			return
+		}
+		mask &^= (1<<n - 1) << first
+	}
+}
+
+// subpageLayout locates the saved blocks of each committed page of a
+// MemoryFile saved with subpage saving.
+type subpageLayout struct {
+	// size is the block size.
+	size uint64
+
+	// segs are the committed ranges of the MemoryFile, in offset order, each
+	// with the index of its first page in masks and offs.
+	segs []subpageSeg
+
+	// masks[i] is the mask of saved blocks of the i-th committed page.
+	masks []uint64
+
+	// offs[i] is the pages file offset of the i-th committed page's first
+	// saved block.
+	offs []uint64
+}
+
+type subpageSeg struct {
+	memmap.FileRange
+	first int
+}
+
+// addRange appends the committed range fr, whose saved blocks start at pages
+// file offset off, and returns the pages file offset after them.
+func (l *subpageLayout) addRange(fr memmap.FileRange, off uint64, masks []uint64) (uint64, error) {
+	n := int(fr.Length() / hostarch.PageSize)
+	if len(l.masks)+n > len(masks) {
+		return 0, fmt.Errorf("%d subpage masks for at least %d committed pages", len(masks), len(l.masks)+n)
+	}
+	l.segs = append(l.segs, subpageSeg{fr, len(l.masks)})
+	full := fullSubpageMask(l.size)
+	for _, mask := range masks[len(l.masks) : len(l.masks)+n] {
+		if mask == 0 || mask&^full != 0 {
+			return 0, fmt.Errorf("invalid subpage mask %#x for block size %d", mask, l.size)
+		}
+		l.masks = append(l.masks, mask)
+		l.offs = append(l.offs, off)
+		off += uint64(bits.OnesCount64(mask)) * l.size
+	}
+	return off, nil
+}
+
+// pageIndex returns the index into l.masks and l.offs of the committed page
+// at MemoryFile offset off.
+func (l *subpageLayout) pageIndex(off uint64) int {
+	i := sort.Search(len(l.segs), func(i int) bool { return l.segs[i].End > off })
+	if i == len(l.segs) || l.segs[i].Start > off {
+		panic(fmt.Sprintf("MemoryFile offset %#x is not in a committed range saved with subpage saving", off))
+	}
+	return l.segs[i].first + int((off-l.segs[i].Start)/hostarch.PageSize)
+}

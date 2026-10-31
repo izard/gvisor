@@ -134,7 +134,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(RestoreSpecValidationEnforce.Ptr(), "restore-spec-validation", "how to handle spec validation during restore.")
 	flagSet.Bool("systrap-disable-syscall-patching", false, "disables syscall patching when using the Systrap platform. May be necessary to use in case the workload uses the GS register, or uses ptrace within gVisor. Has significant performance implications and is only recommended when the sandbox is known to run otherwise-incompatible workloads. Only relevant for x86.")
 	flagSet.Bool("systrap-disable-fast-path", false, "unconditionally disables the Systrap fast path.")
-	flagSet.Int("save-subpage-size", 0, "if non-zero, checkpoints save the pages of disk-backed memory files (such as overlay filestores) in blocks of this size, skipping blocks of zeros; a power of two of at least 512 smaller than the host page size.")
+	flagSet.Var(SubpageBlocksNone.Ptr(), "save-subpage-blocks", "how checkpoints save the pages of disk-backed memory files (such as overlay filestores): none (default, whole pages), or 4k (on hosts whose page size is larger than 4 KiB, 4 KiB blocks, omitting blocks of zeros; whole pages on other hosts).")
 	flagSet.Bool("allow-suid", false, "allows ID elevation when executing binaries with the SUID/SGID bits set. The OCI --no-new-privileges flag continues to prevent ID elevation even when this flag is true.")
 	flagSet.Bool("kvm-use-cpu-nums", false, "on KVM use vCPU numbers as CPU numbers in the sentry. This is necessary to support features like rseq.")
 	flagSet.Bool("allow-rootfs-tar-annotation", false, "allows the rootfs tar annotation to be set.")

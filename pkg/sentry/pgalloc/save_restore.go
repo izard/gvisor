@@ -184,10 +184,22 @@ type SaveOpts struct {
 	// returns, so SaveTo() may leave zero pages that are already committed on
 	// the host in place rather than decommit them.
 	ExitAfterSaving bool
+
+	// If SubpageSize is not 0 and the MemoryFile is disk-backed, SaveTo()
+	// saves each committed page to PagesFile as only its SubpageSize-byte
+	// blocks that contain non-zero bytes. SubpageSize must be 0 or a valid
+	// subpage size (see ValidSubpageSize). SubpageSize has no effect on
+	// MemoryFiles that are not disk-backed, or if PagesFile is nil. With an
+	// O_DIRECT pages file, SubpageSize must also be a multiple of the file's
+	// direct I/O alignment.
+	SubpageSize uint64
 }
 
 // SaveTo writes f's state to the given stream.
 func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) error {
+	if opts.SubpageSize != 0 && !ValidSubpageSize(opts.SubpageSize) {
+		return fmt.Errorf("invalid subpage size %d for page size %d", opts.SubpageSize, hostarch.PageSize)
+	}
 	if err := f.AwaitLoadAll(); err != nil {
 		return fmt.Errorf("previous async page loading failed: %w", err)
 	}
@@ -258,7 +270,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	// to the mask of its non-zero blocks.
 	subpageSize := uint64(0)
 	if amfs != nil && f.opts.DiskBackedFile {
-		subpageSize = subpageSaveSize.Load()
+		subpageSize = opts.SubpageSize
 	}
 	excludeCommittedZeroPages := opts.ExcludeCommittedZeroPages || subpageSize != 0
 	var subpageMasks map[uint64]uint64
@@ -1226,8 +1238,11 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	// metadata leaves f unchanged. The layout is complete before async page
 	// loading, which reads it concurrently, starts.
 	var subpages *subpageLayout
+	if pb.SubpageSize == 0 && len(pb.SubpageMasks) != 0 {
+		return fmt.Errorf("%d subpage masks without a subpage size", len(pb.SubpageMasks))
+	}
 	if pb.SubpageSize != 0 {
-		if !validSubpageSize(pb.SubpageSize) {
+		if !ValidSubpageSize(pb.SubpageSize) {
 			return fmt.Errorf("invalid subpage size %d for page size %d", pb.SubpageSize, hostarch.PageSize)
 		}
 		if opts.PagesFile == nil {

@@ -47,6 +47,7 @@ import (
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/procfs"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 	"gvisor.dev/gvisor/runsc/starttime"
 	"gvisor.dev/gvisor/runsc/version"
@@ -96,7 +97,7 @@ func (c *controller) registerHandlers() {
 	c.srv.Register(&control.Lifecycle{Kernel: l.k})
 	c.srv.Register(&control.Logging{})
 	c.srv.Register(&control.Proc{Kernel: l.k})
-	c.srv.Register(&control.State{Kernel: l.k})
+	c.srv.Register(&control.State{Kernel: l.k, SubpageBlocks: l.root.conf.SaveSubpageBlocks == config.SubpageBlocks4K})
 	c.srv.Register(&control.Usage{Kernel: l.k})
 	c.srv.Register(&control.Metrics{})
 	c.srv.Register(&debug{})

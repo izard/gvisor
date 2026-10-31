@@ -215,11 +215,13 @@ go_test(
     ],
     embed = [":pgalloc"],
     deps = [
+        ":pgalloc_metadata_go_proto",
         "//pkg/hostarch",
         "//pkg/memutil",
         "//pkg/sentry/memmap",
         "//pkg/sentry/state/stateio",
         "//pkg/timing",
+        "@org_golang_google_protobuf//proto:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

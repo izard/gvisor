@@ -729,9 +729,6 @@ func New(args Args) (*Loader, error) {
 		args.NumCPU = runtime.NumCPU()
 	}
 	gomaxprocs.SetBase(args.NumCPU)
-	if n := args.Conf.SaveSubpageSize; n > 0 {
-		pgalloc.SetSubpageSaveSize(uint64(n))
-	}
 	l.lifecycleCPUs.init(args.LifecycleNumCPU, args.NumCPU)
 	log.Infof("CPUs: %d, lifecycle CPUs: %d", args.NumCPU, l.lifecycleCPUs.num)
 	if len(args.FSRestoreFDs) != 0 || args.RootfsUpperTarFD >= 0 {

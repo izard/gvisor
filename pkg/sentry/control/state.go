@@ -62,6 +62,10 @@ var ErrInvalidFiles = errors.New("exactly one file must be provided")
 type State struct {
 	Kernel   *kernel.Kernel
 	Watchdog *watchdog.Watchdog
+
+	// SubpageBlocks is the value of state.SaveOpts.SubpageBlocks for saves
+	// requested by Save.
+	SubpageBlocks bool
 }
 
 // ConvertToStateSaveOpts converts a control.SaveOpts to a state.SaveOpts.
@@ -228,6 +232,7 @@ func (s *State) Save(o *controlapi.SaveOpts, _ *struct{}) (err error) {
 		return err
 	}
 	defer saveOpts.Close()
+	saveOpts.SubpageBlocks = s.SubpageBlocks
 
 	if err := s.SaveWithOpts(saveOpts, &o.ExecOpts); err != nil {
 		return err

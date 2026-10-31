@@ -886,6 +886,7 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	l.saveMu.Lock()
 	defer l.saveMu.Unlock()
 
+	saveOpts.SubpageBlocks = l.root.conf.SaveSubpageBlocks == config.SubpageBlocks4K
 	hasFSSave := saveOpts.FSSaveOpts != nil
 	defer func() {
 		// This closure is required to capture the final value of err.

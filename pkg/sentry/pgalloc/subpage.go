@@ -24,9 +24,13 @@ package pgalloc
 // reads such pages back block by block; the blocks that were not saved are
 // left zero, as they are in a newly loaded MemoryFile.
 //
-// Subpage saving requires async page saving (a pages file), and only applies
-// to disk-backed MemoryFiles, whose contents are tmpfs data rather than
-// application memory.
+// Subpage saving is selected by SaveOpts.SubpageSize. It requires async page
+// saving (a pages file), and only applies to disk-backed MemoryFiles, whose
+// contents are tmpfs data rather than application memory. Its purpose is to
+// avoid saving the zero padding of small files on hosts whose pages are larger
+// than 4 KiB (see SubpageSize4K). Masks describe base pages, including in
+// huge-page chunks. Checkpoints can only be restored with the same host page
+// size, as for other checkpoints.
 
 import (
 	"bytes"
@@ -34,30 +38,25 @@ import (
 	"math/bits"
 	"sort"
 
-	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 )
 
-// subpageSaveSize is the block size used by subpage saving, or 0 if subpage
-// saving is disabled.
-var subpageSaveSize atomicbitops.Uint64
-
-// SetSubpageSaveSize enables subpage saving with the given block size, or
-// disables it if size is 0. size must be a power of two of at least 512 bytes
-// that is smaller than hostarch.PageSize and divides it into at most 64
-// blocks; otherwise subpage saving is disabled.
-func SetSubpageSaveSize(size uint64) {
-	if size != 0 && !validSubpageSize(size) {
-		log.Warningf("Ignoring invalid subpage save size %d for page size %d", size, hostarch.PageSize)
-		size = 0
+// SubpageSize4K returns the SaveOpts.SubpageSize that saves 4 KiB blocks, or
+// 0 if that is not a valid subpage size because host pages are not larger than
+// 4 KiB (or are more than 64 times larger).
+func SubpageSize4K() uint64 {
+	if ValidSubpageSize(4096) {
+		return 4096
 	}
-	subpageSaveSize.Store(size)
+	return 0
 }
 
-func validSubpageSize(size uint64) bool {
+// ValidSubpageSize returns true if size is a valid SaveOpts.SubpageSize other
+// than 0: a power of two of at least 512 bytes that is smaller than
+// hostarch.PageSize and divides it into at most 64 blocks.
+func ValidSubpageSize(size uint64) bool {
 	return size >= 512 && size < hostarch.PageSize && size&(size-1) == 0 && hostarch.PageSize/size <= 64
 }
 

@@ -906,7 +906,8 @@ func (apfs *AsyncPagesFileSave) enqueueCurOp() {
 // Preconditions:
 // - apfs.canEnqueue() == true.
 // - mfr.Length() > 0.
-// - mfr must be page-aligned.
+// - mfr must be page-aligned, or aligned to SaveOpts.SubpageSize if
+// mfr.amfs.f is saved with subpage saving.
 func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) uint64 {
 	for {
 		if apfs.curOp == nil {
@@ -939,7 +940,8 @@ func (apfs *AsyncPagesFileSave) enqueueRange(mfr apsRange) uint64 {
 //
 // Preconditions:
 // - mfr.Length() > 0.
-// - mfr must be page-aligned.
+// - mfr must be page-aligned, or aligned to SaveOpts.SubpageSize if
+// mfr.amfs.f is saved with subpage saving.
 func (apfs *AsyncPagesFileSave) combine(mfr apsRange) uint64 {
 	op := apfs.curOp
 	if op.total != 0 {

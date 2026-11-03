@@ -930,7 +930,7 @@ func (k *Kernel) saveToLocked(ctx context.Context, stateFile, pagesMetadata io.W
 	if fsOpts != nil {
 		fsSaveStart := time.Now()
 		for i := range fsOpts.Bundles {
-			if err := k.fsSaveLocked(ctx, &fsOpts.Bundles[i], fsOpts.RunscVersion, mfsToSave, matchCtxs[i]); err != nil {
+			if err := k.fsSaveLocked(ctx, &fsOpts.Bundles[i], fsOpts.RunscVersion, subpageBlocks, mfsToSave, matchCtxs[i]); err != nil {
 				return fmt.Errorf("failed to save split filesystem bundle %d: %w", i, err)
 			}
 		}

@@ -323,24 +323,45 @@ func dupFD(tb testing.TB, f *os.File) int {
 // their metadata.
 func saveAsync(tb testing.TB, pages *os.File, tfs ...*subpageTestFile) *bytes.Buffer {
 	tb.Helper()
+	meta, _ := saveAsyncRecorded(tb, pages, tfs...)
+	return meta
+}
+
+// savedMemoryFile locates a MemoryFile saved by saveAsyncRecorded, as a
+// filesystem checkpoint manifest does.
+type savedMemoryFile struct {
+	metaStart, metaEnd int
+	pagesStart         uint64
+}
+
+// saveAsyncRecorded is saveAsync that also returns where each MemoryFile's
+// metadata and pages were saved.
+func saveAsyncRecorded(tb testing.TB, pages *os.File, tfs ...*subpageTestFile) (*bytes.Buffer, []savedMemoryFile) {
+	tb.Helper()
 	saveDone := make(chan error, 1)
 	apfs, err := StartAsyncPagesFileSave(stateio.NewPagesFileFDWriterDefault(int32(dupFD(tb, pages))), func(err error) { saveDone <- err })
 	if err != nil {
 		tb.Fatalf("StartAsyncPagesFileSave: %v", err)
 	}
-	var meta bytes.Buffer
+	var (
+		meta  bytes.Buffer
+		saved []savedMemoryFile
+	)
 	for _, tf := range tfs {
+		s := savedMemoryFile{metaStart: meta.Len(), pagesStart: apfs.PagesFileOffset()}
 		if err := tf.f.SaveTo(context.Background(), &meta, &SaveOpts{PagesFile: apfs, SubpageSize: tf.subpageSize}); err != nil {
 			apfs.MemoryFilesDone()
 			<-saveDone
 			tb.Fatalf("SaveTo: %v", err)
 		}
+		s.metaEnd = meta.Len()
+		saved = append(saved, s)
 	}
 	apfs.MemoryFilesDone()
 	if err := <-saveDone; err != nil {
 		tb.Fatalf("async page saving: %v", err)
 	}
-	return &meta
+	return &meta, saved
 }
 
 // subpageLoadConfig configures async page loading in tests.
@@ -366,10 +387,14 @@ func (lc subpageLoadConfig) String() string {
 
 func startAsyncLoad(tb testing.TB, pages *os.File, lc subpageLoadConfig) *AsyncPagesFileLoad {
 	tb.Helper()
+	// Construct only the selected reader: an FDReader starts its workers and
+	// takes ownership of rfd when constructed.
 	rfd := dupFD(tb, pages)
-	var ar stateio.AsyncReader = stateio.NewPagesFileFDReaderDefault(int32(rfd), 1)
+	var ar stateio.AsyncReader
 	if lc.dstRanges != 0 {
 		ar = &dstRangeReader{fd: rfd, maxRanges: lc.dstRanges}
+	} else {
+		ar = stateio.NewPagesFileFDReaderDefault(int32(rfd), 1)
 	}
 	timer := timing.New("test", time.Now())
 	tb.Cleanup(timer.End)
@@ -606,6 +631,51 @@ func TestSubpageSaveRestoreSharedPagesFile(t *testing.T) {
 	}
 }
 
+// TestSubpageLoadAtRecordedOffsets loads MemoryFiles individually and in
+// reverse order, each from the metadata range and pages file offset recorded
+// when it was saved, as filesystem checkpoint restore does with the offsets in
+// its manifest.
+func TestSubpageLoadAtRecordedOffsets(t *testing.T) {
+	size := validSubpageSizes()[0]
+	masks := subpageTestMasks(size)
+	tfs := []*subpageTestFile{
+		newSubpageTestFile(t, true /* diskBacked */, size, masks, size),
+		newSubpageTestFile(t, true /* diskBacked */, size, masks, size),
+		newSubpageTestFile(t, true /* diskBacked */, size, masks, 0),
+	}
+	pages := newPagesFile(t)
+	meta, saved := saveAsyncRecorded(t, pages, tfs...)
+	for i, s := range saved {
+		if s.pagesStart%MinSubpageSize != 0 {
+			t.Errorf("file %d starts at pages file offset %#x, which is not a multiple of %d", i, s.pagesStart, MinSubpageSize)
+		}
+	}
+	if hostarch.IsPageAligned(saved[1].pagesStart) {
+		t.Fatalf("file 1 starts at page-aligned pages file offset %#x, want an unaligned offset after a sparsely saved file", saved[1].pagesStart)
+	}
+
+	apfl := startAsyncLoad(t, pages, subpageLoadConfig{})
+	restored := make([]*MemoryFile, len(tfs))
+	for i := len(tfs) - 1; i >= 0; i-- {
+		restored[i] = newTestMemoryFile(t, true /* diskBacked */)
+		t.Cleanup(restored[i].Destroy)
+		r := bytes.NewReader(meta.Bytes()[saved[i].metaStart:saved[i].metaEnd])
+		opts := LoadOpts{PagesFile: apfl, PagesFileOffset: saved[i].pagesStart}
+		if err := restored[i].LoadFrom(context.Background(), r, &opts); err != nil {
+			apfl.MemoryFilesDone()
+			t.Fatalf("LoadFrom for file %d at pages file offset %#x: %v", i, saved[i].pagesStart, err)
+		}
+		t.Cleanup(func() { restored[i].DecRef(tfs[i].fr) })
+	}
+	apfl.MemoryFilesDone()
+	for i, tf := range tfs {
+		if err := restored[i].AwaitLoadAll(); err != nil {
+			t.Fatalf("AwaitLoadAll for file %d: %v", i, err)
+		}
+		checkSubpageContents(t, restored[i], tf.fr, tf.want, fmt.Sprintf("file %d", i))
+	}
+}
+
 func TestSubpageLoadMalformedMetadata(t *testing.T) {
 	size := validSubpageSizes()[0]
 	tf := newSubpageTestFile(t, true /* diskBacked */, size, subpageTestMasks(size), size)
@@ -685,10 +755,21 @@ func TestSubpageLoadMalformedMetadata(t *testing.T) {
 // async page saving and loading, with sparse (one block per page), fragmented
 // (every other block) and dense contents, with and without subpage saving.
 // The pages file is in the page cache when it is loaded.
+//
+// Subpage saving uses 4 KiB blocks, as --save-subpage-blocks=4k does, if host
+// pages are larger. Otherwise that flag saves whole pages, so the benchmark
+// uses the smallest valid block size instead, which only tests can select,
+// and labels it "-testonly".
+//
+// Memory is reported as Go heap allocations per op. Peak RSS isn't reported:
+// it is the high-water mark of the whole process, across benchmarks, and is
+// dominated by the test file and its expected contents.
 func BenchmarkSubpageSaveRestore(b *testing.B) {
 	size := SubpageSize4K()
+	label := fmt.Sprintf("subpage=%d", size)
 	if size == 0 {
 		size = validSubpageSizes()[0]
+		label = fmt.Sprintf("subpage=%d-testonly", size)
 	}
 	const fileBytes = 64 << 20
 	for _, c := range []struct {
@@ -700,7 +781,11 @@ func BenchmarkSubpageSaveRestore(b *testing.B) {
 		{"dense", fullSubpageMask(size)},
 	} {
 		for _, subpageSize := range []uint64{0, size} {
-			b.Run(fmt.Sprintf("%s/subpage=%d", c.name, subpageSize), func(b *testing.B) {
+			name := "subpage=0"
+			if subpageSize != 0 {
+				name = label
+			}
+			b.Run(c.name+"/"+name, func(b *testing.B) {
 				masks := make([]uint64, fileBytes/hostarch.PageSize)
 				for i := range masks {
 					masks[i] = c.mask
@@ -725,6 +810,12 @@ func benchmarkSubpageSaveRestore(b *testing.B, tf *subpageTestFile) {
 		}
 		return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
 	}
+	// Pages written through the file aren't known to be committed until a
+	// save scans them. After that, saves without subpage saving skip the
+	// scan, as they do for a restored MemoryFile, while subpage saving scans
+	// on every save. Save once first so that both are measured in that steady
+	// state.
+	saveAsync(b, pages, tf)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -764,13 +855,10 @@ func benchmarkSubpageSaveRestore(b *testing.B, tf *subpageTestFile) {
 		b.StartTimer()
 	}
 	b.StopTimer()
-	var ru unix.Rusage
-	unix.Getrusage(unix.RUSAGE_SELF, &ru)
 	n := float64(b.N)
 	b.ReportMetric(float64(saveDur.Microseconds())/n/1e3, "save-ms/op")
 	b.ReportMetric(float64(loadDur.Microseconds())/n/1e3, "restore-ms/op")
 	b.ReportMetric(float64(cpuDur.Microseconds())/n/1e3, "cpu-ms/op")
 	b.ReportMetric(float64(metaBytes), "metadata-B")
 	b.ReportMetric(float64(pgBytes), "pagesfile-B")
-	b.ReportMetric(float64(ru.Maxrss)/1024, "maxrss-MiB")
 }

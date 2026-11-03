@@ -53,11 +53,16 @@ func SubpageSize4K() uint64 {
 	return 0
 }
 
+// MinSubpageSize is the smallest valid SaveOpts.SubpageSize. Every MemoryFile
+// saved to a pages file starts at an offset that is a multiple of
+// MinSubpageSize, since every valid subpage size and hostarch.PageSize are.
+const MinSubpageSize = 512
+
 // ValidSubpageSize returns true if size is a valid SaveOpts.SubpageSize other
-// than 0: a power of two of at least 512 bytes that is smaller than
+// than 0: a power of two of at least MinSubpageSize bytes that is smaller than
 // hostarch.PageSize and divides it into at most 64 blocks.
 func ValidSubpageSize(size uint64) bool {
-	return size >= 512 && size < hostarch.PageSize && size&(size-1) == 0 && hostarch.PageSize/size <= 64
+	return size >= MinSubpageSize && size < hostarch.PageSize && size&(size-1) == 0 && hostarch.PageSize/size <= 64
 }
 
 // subpageMask returns a mask with bit i set if the i-th size-byte block of pg

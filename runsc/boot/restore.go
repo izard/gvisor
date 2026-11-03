@@ -879,6 +879,12 @@ func (l *Loader) save(o *controlapi.SaveOpts) error {
 	return l.saveWithOpts(saveOpts, &o.ExecOpts)
 }
 
+// saveSubpageBlocks returns the value of state.SaveOpts.SubpageBlocks and
+// kernel.FSSaveOpts.SubpageBlocks for checkpoints of this sandbox.
+func (l *Loader) saveSubpageBlocks() bool {
+	return l.root.conf.SaveSubpageBlocks == config.SubpageBlocks4K
+}
+
 // saveWithOpts saves the kernel with the given options.
 func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.SaveRestoreExecOpts) (err error) {
 	// Fully serialize save operations, including post-save cleanup. See
@@ -886,7 +892,7 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *controlapi.Sav
 	l.saveMu.Lock()
 	defer l.saveMu.Unlock()
 
-	saveOpts.SubpageBlocks = l.root.conf.SaveSubpageBlocks == config.SubpageBlocks4K
+	saveOpts.SubpageBlocks = l.saveSubpageBlocks()
 	hasFSSave := saveOpts.FSSaveOpts != nil
 	defer func() {
 		// This closure is required to capture the final value of err.

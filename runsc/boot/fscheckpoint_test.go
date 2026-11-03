@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 )
 
 // boundsTestCase exercises the bounds checks that protect the restore path
@@ -102,25 +103,49 @@ func TestMemoryFileLoadArgsBounds(t *testing.T) {
 	}
 }
 
-// TestMemoryFileLoadArgsUnalignedPages checks that a pages offset that is not
-// page aligned is rejected, since the memory file can't be loaded from it.
-func TestMemoryFileLoadArgsUnalignedPages(t *testing.T) {
+// TestMemoryFileLoadArgsPagesAlignment checks that a pages offset is accepted
+// if it is a multiple of pgalloc.MinSubpageSize, as are the offsets of
+// MemoryFiles saved after one saved with subpage saving, even if it is not
+// page-aligned, and rejected otherwise, since no MemoryFile can be loaded from
+// it.
+func TestMemoryFileLoadArgsPagesAlignment(t *testing.T) {
 	metadata := []byte("0123456789")
 	resID := checkpoint.ResourceID{ContainerName: "c1", Path: "/dev/shm"}
 
-	fsr := newTestFSRestore()
-	fsr.mfs[resID] = &fscheckpoint.MemoryFile{
-		ResourceID:         resID,
-		PagesMetadataStart: 0,
-		PagesMetadataEnd:   5,
-		PagesStart:         123,
-	}
-	fsr.fsBundles[resID] = &fsRestoreBundle{
-		getPagesMetadata: func() ([]byte, error) { return metadata, nil },
-	}
+	for _, tc := range []struct {
+		pagesStart uint64
+		wantErr    bool
+	}{
+		{0, false},
+		{3 * pgalloc.MinSubpageSize, false},
+		{123, true},
+		{pgalloc.MinSubpageSize + 1, true},
+	} {
+		fsr := newTestFSRestore()
+		fsr.mfs[resID] = &fscheckpoint.MemoryFile{
+			ResourceID:         resID,
+			PagesMetadataStart: 0,
+			PagesMetadataEnd:   5,
+			PagesStart:         tc.pagesStart,
+		}
+		fsr.fsBundles[resID] = &fsRestoreBundle{
+			getPagesMetadata: func() ([]byte, error) { return metadata, nil },
+		}
 
-	if _, _, err := fsr.memoryFileLoadArgs(resID, "c1"); err == nil {
-		t.Errorf("memoryFileLoadArgs() with unaligned pages start succeeded, want error")
+		_, opts, err := fsr.memoryFileLoadArgs(resID, "c1")
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("memoryFileLoadArgs() with pages start %d succeeded, want error", tc.pagesStart)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("memoryFileLoadArgs() with pages start %d failed: %v", tc.pagesStart, err)
+			continue
+		}
+		if opts.PagesFileOffset != tc.pagesStart {
+			t.Errorf("memoryFileLoadArgs() with pages start %d returned PagesFileOffset %d", tc.pagesStart, opts.PagesFileOffset)
+		}
 	}
 }
 

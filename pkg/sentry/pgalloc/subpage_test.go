@@ -523,8 +523,8 @@ func TestSubpageSaveRestoreBlockSizes(t *testing.T) {
 					t.Errorf("pages file size = %d, want %d", got, want)
 				}
 				pb := parseMetadata(t, meta.Bytes())
-				if pb.SubpageSize != size || uint64(len(pb.SubpageMasks)) != tf.nonzeroPages {
-					t.Errorf("metadata has subpage size %d and %d masks, want %d and %d", pb.SubpageSize, len(pb.SubpageMasks), size, tf.nonzeroPages)
+				if pb.Version != metadataVersionSubpages || pb.SubpageSize != size || uint64(len(pb.SubpageMasks)) != tf.nonzeroPages {
+					t.Errorf("metadata has version %d, subpage size %d and %d masks, want %d, %d and %d", pb.Version, pb.SubpageSize, len(pb.SubpageMasks), metadataVersionSubpages, size, tf.nonzeroPages)
 				}
 				loadAsync(t, meta, pages, lc, subpageTestAwaits, tf)
 			})
@@ -558,11 +558,14 @@ func TestSubpageSaveDisabled(t *testing.T) {
 }
 
 // checkWholePageFormat checks that a MemoryFile was saved in the format used
-// without subpage saving: its metadata, the first MemoryFile in meta, contains
-// neither subpage field (proto3 does not serialize zero values), and pages
-// holds exactly its non-zero pages, whole and in order.
+// without subpage saving: its metadata, the first MemoryFile in meta, has
+// version 1 and contains neither subpage field (proto3 does not serialize zero
+// values), and pages holds exactly its non-zero pages, whole and in order.
 func checkWholePageFormat(t *testing.T, meta []byte, pages *os.File, tf *subpageTestFile) {
 	t.Helper()
+	if v := parseMetadata(t, meta).Version; v != metadataVersionWholePages {
+		t.Errorf("metadata has version %d, want %d", v, metadataVersionWholePages)
+	}
 	n := binary.LittleEndian.Uint64(meta)
 	for b := meta[8 : 8+n]; len(b) > 0; {
 		num, typ, tagLen := protowire.ConsumeTag(b)
@@ -795,6 +798,14 @@ func TestSubpageLoadMalformedMetadata(t *testing.T) {
 		{name: "invalid subpage size", mutate: func(pb *pgallocpb.MemoryFileMetadataProto) { pb.SubpageSize = 3000 }},
 		{name: "page-sized subpages", mutate: func(pb *pgallocpb.MemoryFileMetadataProto) { pb.SubpageSize = hostarch.PageSize }},
 		{name: "masks without subpage size", mutate: func(pb *pgallocpb.MemoryFileMetadataProto) { pb.SubpageSize = 0 }},
+		// A runsc without subpage saving would read this metadata as whole
+		// pages, ignoring the subpage fields.
+		{name: "version 1 with subpage fields", mutate: func(pb *pgallocpb.MemoryFileMetadataProto) { pb.Version = metadataVersionWholePages }},
+		{name: "version 2 without subpage fields", mutate: func(pb *pgallocpb.MemoryFileMetadataProto) {
+			pb.SubpageSize = 0
+			pb.SubpageMasks = nil
+		}},
+		{name: "unknown version", mutate: func(pb *pgallocpb.MemoryFileMetadataProto) { pb.Version = metadataVersionSubpages + 1 }},
 		{name: "missing mask", mutate: func(pb *pgallocpb.MemoryFileMetadataProto) {
 			pb.SubpageMasks = pb.SubpageMasks[:len(pb.SubpageMasks)-1]
 		}},

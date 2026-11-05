@@ -63,9 +63,19 @@ func (f *MemoryFile) ResourceID() checkpoint.ResourceID {
 	return f.opts.ResourceID
 }
 
+// MemoryFileMetadataProto versions. Version 1 describes MemoryFiles saved with
+// whole pages, and is the only version that runsc versions without subpage
+// saving accept. Version 2 describes MemoryFiles saved with subpage saving,
+// which version 1 readers would otherwise misread, since proto3 parsers
+// silently drop the unknown subpage_size and subpage_masks fields.
+const (
+	metadataVersionWholePages = 1
+	metadataVersionSubpages   = 2
+)
+
 func (f *MemoryFile) exportMetadataProto() *pgallocpb.MemoryFileMetadataProto {
 	pb := &pgallocpb.MemoryFileMetadataProto{
-		Version:     1,
+		Version:     metadataVersionWholePages,
 		Subreleased: make(map[uint64]uint64, len(f.subreleased)),
 	}
 	for k, v := range f.subreleased {
@@ -119,10 +129,8 @@ func (f *MemoryFile) exportMetadataProto() *pgallocpb.MemoryFileMetadataProto {
 	return pb
 }
 
+// Preconditions: checkMetadataVersion(pb) == nil.
 func (f *MemoryFile) importMetadataProto(pb *pgallocpb.MemoryFileMetadataProto) error {
-	if pb.Version != 1 {
-		return fmt.Errorf("unsupported MemoryFileMetadataProto version %d", pb.Version)
-	}
 	f.subreleased = make(map[uint64]uint64, len(pb.Subreleased))
 	for k, v := range pb.Subreleased {
 		f.subreleased[k] = v
@@ -616,6 +624,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	}
 	pb := f.exportMetadataProto()
 	if subpageSize != 0 {
+		pb.Version = metadataVersionSubpages
 		pb.SubpageSize = subpageSize
 		full := fullSubpageMask(subpageSize)
 		maskedBytes := uint64(0)
@@ -1262,8 +1271,8 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		subpages    *subpageLayout
 		subpagesEnd uint64
 	)
-	if pb.SubpageSize == 0 && len(pb.SubpageMasks) != 0 {
-		return fmt.Errorf("%d subpage masks without a subpage size", len(pb.SubpageMasks))
+	if err := checkMetadataVersion(&pb); err != nil {
+		return err
 	}
 	if pb.SubpageSize != 0 {
 		if !ValidSubpageSize(pb.SubpageSize) {

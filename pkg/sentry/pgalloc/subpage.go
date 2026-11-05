@@ -43,6 +43,24 @@ import (
 	pgallocpb "gvisor.dev/gvisor/pkg/sentry/pgalloc/pgalloc_metadata_go_proto"
 )
 
+// checkMetadataVersion returns an error if pb's version is not supported or
+// does not match whether pb describes a MemoryFile saved with subpage saving.
+func checkMetadataVersion(pb *pgallocpb.MemoryFileMetadataProto) error {
+	switch pb.Version {
+	case metadataVersionWholePages:
+		if pb.SubpageSize != 0 || len(pb.SubpageMasks) != 0 {
+			return fmt.Errorf("MemoryFileMetadataProto version %d has subpage size %d and %d subpage masks", pb.Version, pb.SubpageSize, len(pb.SubpageMasks))
+		}
+	case metadataVersionSubpages:
+		if pb.SubpageSize == 0 {
+			return fmt.Errorf("MemoryFileMetadataProto version %d has no subpage size", pb.Version)
+		}
+	default:
+		return fmt.Errorf("unsupported MemoryFileMetadataProto version %d", pb.Version)
+	}
+	return nil
+}
+
 // SubpageSize4K returns the SaveOpts.SubpageSize that saves 4 KiB blocks, or
 // 0 if that is not a valid subpage size because host pages are not larger than
 // 4 KiB (or are more than 64 times larger).

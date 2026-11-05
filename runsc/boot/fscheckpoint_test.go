@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/fscheckpoint"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/runsc/config"
 )
 
 // boundsTestCase exercises the bounds checks that protect the restore path
@@ -205,5 +206,20 @@ func TestAddRestoreEntryDuplicates(t *testing.T) {
 	// Same ResourceID across different bundles (e.g. MemoryFile in b1, Tmpfs in b2) should fail.
 	if err := addRestoreEntry(tmpfsMap, fsBundles, c1Data, 4, b2, "Tmpfs"); err == nil || !strings.Contains(err.Error(), "multiple filesystem checkpoint bundles") {
 		t.Errorf("addRestoreEntry(%v) across bundles error = %v, want multiple bundles error", c1Data, err)
+	}
+}
+
+func TestSaveSubpageBlocksDefault(t *testing.T) {
+	for _, tc := range []struct {
+		policy config.SubpageBlocksPolicy
+		want   bool
+	}{
+		{config.SubpageBlocksNone, false},
+		{config.SubpageBlocks4K, true},
+	} {
+		l := &Loader{root: containerInfo{conf: &config.Config{SaveSubpageBlocks: tc.policy}}}
+		if got := l.saveSubpageBlocks(); got != tc.want {
+			t.Errorf("saveSubpageBlocks() with --save-subpage-blocks=%s = %t, want %t", tc.policy, got, tc.want)
+		}
 	}
 }

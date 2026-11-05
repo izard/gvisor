@@ -64,8 +64,17 @@ type State struct {
 	Watchdog *watchdog.Watchdog
 
 	// SubpageBlocks is the value of state.SaveOpts.SubpageBlocks for saves
-	// requested by Save.
+	// requested by Save, unless controlapi.SaveOpts.SubpageBlocks overrides it.
 	SubpageBlocks bool
+}
+
+// SubpageBlocks returns the value of state.SaveOpts.SubpageBlocks for a save
+// requested with o: o.SubpageBlocks if it is set, and otherwise def.
+func SubpageBlocks(o *controlapi.SaveOpts, def bool) bool {
+	if o.SubpageBlocks != nil {
+		return *o.SubpageBlocks
+	}
+	return def
 }
 
 // ConvertToStateSaveOpts converts a control.SaveOpts to a state.SaveOpts.
@@ -232,7 +241,7 @@ func (s *State) Save(o *controlapi.SaveOpts, _ *struct{}) (err error) {
 		return err
 	}
 	defer saveOpts.Close()
-	saveOpts.SubpageBlocks = s.SubpageBlocks
+	saveOpts.SubpageBlocks = SubpageBlocks(o, s.SubpageBlocks)
 
 	if err := s.SaveWithOpts(saveOpts, &o.ExecOpts); err != nil {
 		return err

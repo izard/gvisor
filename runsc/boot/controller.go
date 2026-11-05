@@ -918,6 +918,9 @@ func (cm *containerManager) FSSave(args *sentryapi.FSSaveArgs, _ *struct{}) erro
 		return err
 	}
 	kopts.SubpageBlocks = cm.l.saveSubpageBlocks()
+	if args.SubpageBlocks != nil {
+		kopts.SubpageBlocks = *args.SubpageBlocks
+	}
 	defer cm.l.stopIfKilled()
 	return cm.l.k.FSSave(cm.l.k.SupervisorContext(), &kopts)
 }

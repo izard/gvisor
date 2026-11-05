@@ -446,6 +446,11 @@ type Config struct {
 	// OCI annotation or bundle overrides run.
 	cliStateEngine *StateEnginePolicy
 
+	// cliSaveSubpageBlocks records the --save-subpage-blocks policy explicitly
+	// passed on the command line when this Config was constructed via
+	// NewFromFlags.
+	cliSaveSubpageBlocks *SubpageBlocksPolicy
+
 	// ReproduceNAT, when true, tells runsc to scrape the host network
 	// namespace's NAT iptables and reproduce it inside the sandbox.
 	ReproduceNAT bool `flag:"reproduce-nat"`
@@ -490,7 +495,8 @@ type Config struct {
 
 	// SaveSubpageBlocks controls whether checkpoints save the pages of
 	// disk-backed memory files (such as overlay filestores) in blocks smaller
-	// than a page, omitting blocks of zeros.
+	// than a page, omitting blocks of zeros. It is the sandbox's default, which
+	// the checkpoint and fscheckpoint commands can override per checkpoint.
 	SaveSubpageBlocks SubpageBlocksPolicy `flag:"save-subpage-blocks"`
 
 	// UseCPUNums causes the sentry to use KVM CPU numbers as CPU numbers in the

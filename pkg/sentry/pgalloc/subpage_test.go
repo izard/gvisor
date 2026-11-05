@@ -20,12 +20,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"slices"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/memutil"
@@ -92,14 +94,20 @@ func TestValidSubpageSize(t *testing.T) {
 		t.Errorf("valid subpage sizes %v for page size %d", sizes, hostarch.PageSize)
 	}
 	t.Logf("valid subpage sizes for page size %d: %v", hostarch.PageSize, sizes)
+}
 
-	size4K := SubpageSize4K()
-	want4K := uint64(0)
+// TestSubpageSize4K checks that SubpageSize4K, the only SaveOpts.SubpageSize
+// that runsc uses, disables subpage saving on hosts with 4 KiB pages.
+func TestSubpageSize4K(t *testing.T) {
+	want := uint64(0)
 	if hostarch.PageSize > 4096 && hostarch.PageSize/4096 <= 64 {
-		want4K = 4096
+		want = 4096
 	}
-	if size4K != want4K {
-		t.Errorf("SubpageSize4K() = %d, want %d for page size %d", size4K, want4K, hostarch.PageSize)
+	if got := SubpageSize4K(); got != want {
+		t.Errorf("SubpageSize4K() = %d, want %d for page size %d", got, want, hostarch.PageSize)
+	}
+	if hostarch.PageSize == 4096 && ValidSubpageSize(4096) {
+		t.Errorf("ValidSubpageSize(4096) = true for page size 4096, which would enable subpage saving on 4 KiB hosts")
 	}
 }
 
@@ -547,6 +555,101 @@ func TestSubpageSaveDisabled(t *testing.T) {
 			loadAsync(t, meta, pages, subpageLoadConfig{}, subpageTestAwaits, tf)
 		})
 	}
+}
+
+// checkWholePageFormat checks that a MemoryFile was saved in the format used
+// without subpage saving: its metadata, the first MemoryFile in meta, contains
+// neither subpage field (proto3 does not serialize zero values), and pages
+// holds exactly its non-zero pages, whole and in order.
+func checkWholePageFormat(t *testing.T, meta []byte, pages *os.File, tf *subpageTestFile) {
+	t.Helper()
+	n := binary.LittleEndian.Uint64(meta)
+	for b := meta[8 : 8+n]; len(b) > 0; {
+		num, typ, tagLen := protowire.ConsumeTag(b)
+		if tagLen < 0 {
+			t.Fatalf("malformed metadata: %v", protowire.ParseError(tagLen))
+		}
+		if num == subpageSizeField || num == subpageMasksField {
+			t.Errorf("metadata contains field %d", num)
+		}
+		valLen := protowire.ConsumeFieldValue(num, typ, b[tagLen:])
+		if valLen < 0 {
+			t.Fatalf("malformed metadata: %v", protowire.ParseError(valLen))
+		}
+		b = b[tagLen+valLen:]
+	}
+	var want []byte
+	for off := uint64(0); off < uint64(len(tf.want)); off += hostarch.PageSize {
+		if pg := tf.want[off : off+hostarch.PageSize]; slices.ContainsFunc(pg, func(b byte) bool { return b != 0 }) {
+			want = append(want, pg...)
+		}
+	}
+	got, err := io.ReadAll(io.NewSectionReader(pages, 0, math.MaxInt64))
+	if err != nil {
+		t.Fatalf("reading pages file: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("pages file holds %d bytes, want the file's %d bytes of non-zero pages", len(got), len(want))
+	}
+}
+
+// Field numbers of MemoryFileMetadataProto.subpage_size and subpage_masks.
+const (
+	subpageSizeField  protowire.Number = 9
+	subpageMasksField protowire.Number = 10
+)
+
+// TestSubpageSaveFormatUnchanged checks that saving without subpage saving,
+// which includes every save that runsc makes on hosts with 4 KiB pages, writes
+// metadata and a pages file in the format used before subpage saving existed,
+// and that on such hosts SaveOpts.SubpageSize = SubpageSize4K() changes
+// neither. (Metadata is compared after parsing, since proto map fields are not
+// marshaled in a deterministic order.)
+func TestSubpageSaveFormatUnchanged(t *testing.T) {
+	size := validSubpageSizes()[0]
+	masks := subpageTestMasks(size)
+	for _, tc := range []struct {
+		name        string
+		diskBacked  bool
+		subpageSize uint64
+	}{
+		{"disk-backed without subpage size", true, 0},
+		{"memfd with subpage size", false, size},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tf := newSubpageTestFile(t, tc.diskBacked, size, masks, tc.subpageSize)
+			pages := newPagesFile(t)
+			meta := saveAsync(t, pages, tf)
+			checkWholePageFormat(t, meta.Bytes(), pages, tf)
+		})
+	}
+
+	t.Run("disk-backed with SubpageSize4K", func(t *testing.T) {
+		if SubpageSize4K() != 0 {
+			t.Skipf("SubpageSize4K() enables subpage saving on page size %d", hostarch.PageSize)
+		}
+		var (
+			metas [2]*pgallocpb.MemoryFileMetadataProto
+			files [2][]byte
+		)
+		for i, subpageSize := range []uint64{0, SubpageSize4K()} {
+			tf := newSubpageTestFile(t, true /* diskBacked */, size, masks, subpageSize)
+			pages := newPagesFile(t)
+			meta := saveAsync(t, pages, tf)
+			checkWholePageFormat(t, meta.Bytes(), pages, tf)
+			data, err := io.ReadAll(io.NewSectionReader(pages, 0, math.MaxInt64))
+			if err != nil {
+				t.Fatalf("reading pages file: %v", err)
+			}
+			metas[i], files[i] = parseMetadata(t, meta.Bytes()), data
+		}
+		if !proto.Equal(metas[0], metas[1]) {
+			t.Errorf("metadata saved with SubpageSize4K() differs from metadata saved without a subpage size")
+		}
+		if !bytes.Equal(files[0], files[1]) {
+			t.Errorf("pages file saved with SubpageSize4K() differs from pages file saved without a subpage size")
+		}
+	})
 }
 
 func TestSubpageSaveInvalidSize(t *testing.T) {

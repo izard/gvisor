@@ -264,60 +264,77 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		queuedFileBytes         uint64
 		subpageSavedBytes       uint64
 	)
-	// With subpage saving, committed pages are scanned even if they are known
-	// to be committed, both to find their non-zero blocks and to exclude zero
-	// pages. subpageMasks maps the offset of each partially-zero committed page
-	// to the mask of its non-zero blocks.
+	// Subpage saving applies only to disk-backed MemoryFiles saved with a pages
+	// file. runsc only sets SubpageSize to SubpageSize4K(), which is 0 if
+	// hostarch.PageSize is 4 KiB. If subpageSize is 0, the rest of SaveTo()
+	// behaves exactly as it does without subpage saving.
 	subpageSize := uint64(0)
 	if amfs != nil && f.opts.DiskBackedFile {
 		subpageSize = opts.SubpageSize
 	}
-	excludeCommittedZeroPages := opts.ExcludeCommittedZeroPages || subpageSize != 0
+	// With subpage saving, committed pages are scanned even if they are known
+	// to be committed, both to find their non-zero blocks and to exclude zero
+	// pages. subpageMasks maps the offset of each partially-zero committed page
+	// to the mask of its non-zero blocks.
 	var subpageMasks map[uint64]uint64
 	if subpageSize != 0 {
 		subpageMasks = make(map[uint64]uint64)
+		subpageOpts := *opts
+		subpageOpts.ExcludeCommittedZeroPages = true
+		opts = &subpageOpts
 	}
 	asyncWritePages := func(fr memmap.FileRange) {}
 	if amfs != nil {
 		asyncWritePages = func(fr memmap.FileRange) {
+			amount := fr.Length()
+			queuedPageBytes += amount
+			amfs.pf.mu.Lock()
+			amfs.pf.unsaved.PushBack(apsRange{
+				amfs:      amfs,
+				FileRange: fr,
+			})
+			amfs.pf.saveOff += amount
+			amfs.pf.mu.Unlock()
+			amfs.pf.stStatus.Notify(apsSTPending)
+		}
+	}
+	if subpageSize != 0 {
+		// Queue only the non-zero blocks of each page, coalescing contiguous
+		// blocks to keep amfs.pf.unsaved small.
+		asyncWritePages = func(fr memmap.FileRange) {
 			queuedPageBytes += fr.Length()
 			amfs.pf.mu.Lock()
-			push := func(fr memmap.FileRange) {
+			var cur memmap.FileRange
+			push := func() {
 				amfs.pf.unsaved.PushBack(apsRange{
 					amfs:      amfs,
-					FileRange: fr,
+					FileRange: cur,
 				})
-				amfs.pf.saveOff += fr.Length()
-				queuedFileBytes += fr.Length()
+				amfs.pf.saveOff += cur.Length()
+				queuedFileBytes += cur.Length()
 			}
-			if subpageSize == 0 {
-				push(fr)
-			} else {
-				// Coalesce contiguous blocks to keep amfs.pf.unsaved small.
-				var cur memmap.FileRange
-				add := func(r memmap.FileRange) {
-					if cur.Length() != 0 && cur.End == r.Start {
-						cur.End = r.End
-						return
-					}
-					if cur.Length() != 0 {
-						push(cur)
-					}
-					cur = r
-				}
-				for off := fr.Start; off < fr.End; off += hostarch.PageSize {
-					mask, ok := subpageMasks[off]
-					if !ok {
-						add(memmap.FileRange{off, off + hostarch.PageSize})
-						continue
-					}
-					forEachSubpageRun(mask, func(first, end uint64) {
-						add(memmap.FileRange{off + first*subpageSize, off + end*subpageSize})
-					})
+			add := func(r memmap.FileRange) {
+				if cur.Length() != 0 && cur.End == r.Start {
+					cur.End = r.End
+					return
 				}
 				if cur.Length() != 0 {
-					push(cur)
+					push()
 				}
+				cur = r
+			}
+			for off := fr.Start; off < fr.End; off += hostarch.PageSize {
+				mask, ok := subpageMasks[off]
+				if !ok {
+					add(memmap.FileRange{off, off + hostarch.PageSize})
+					continue
+				}
+				forEachSubpageRun(mask, func(first, end uint64) {
+					add(memmap.FileRange{off + first*subpageSize, off + end*subpageSize})
+				})
+			}
+			if cur.Length() != 0 {
+				push()
 			}
 			amfs.pf.mu.Unlock()
 			amfs.pf.stStatus.Notify(apsSTPending)
@@ -548,7 +565,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 		switch {
 		case scanErr != nil:
 			// Keep resetting commitSeq above; the save fails below.
-		case wasCommitted && !excludeCommittedZeroPages:
+		case wasCommitted && !opts.ExcludeCommittedZeroPages:
 			alreadyCommittedBytes += fr.Length()
 			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */)
 		case wasCommitted:
@@ -1238,8 +1255,13 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	}
 	// Check subpage saving before importing metadata, so that invalid
 	// metadata leaves f unchanged. The layout is complete before async page
-	// loading, which reads it concurrently, starts.
-	var subpages *subpageLayout
+	// loading, which reads it concurrently, starts. Metadata saved without
+	// subpage saving has neither field set, leaving subpages nil, and the rest
+	// of LoadFrom() then behaves exactly as it does without subpage saving.
+	var (
+		subpages    *subpageLayout
+		subpagesEnd uint64
+	)
 	if pb.SubpageSize == 0 && len(pb.SubpageMasks) != 0 {
 		return fmt.Errorf("%d subpage masks without a subpage size", len(pb.SubpageMasks))
 	}
@@ -1253,14 +1275,10 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		if n := maxSubpageRuns(pb.SubpageSize); opts.PagesFile.ar.MaxRanges() < n {
 			return fmt.Errorf("MemoryFile saved with %d-byte subpages requires reads of at least %d ranges, pages file supports %d", pb.SubpageSize, n, opts.PagesFile.ar.MaxRanges())
 		}
-		var (
-			end uint64
-			err error
-		)
-		if subpages, end, err = newSubpageLayout(&pb, opts.PagesFileOffset); err != nil {
+		var err error
+		if subpages, subpagesEnd, err = newSubpageLayout(&pb, opts.PagesFileOffset); err != nil {
 			return err
 		}
-		opts.PagesFileOffset = end
 	}
 	if err := f.importMetadataProto(&pb); err != nil {
 		return fmt.Errorf("failed to import metadata: %w", err)
@@ -1371,10 +1389,6 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 	wr := wire.Reader{Reader: r}
 	timePagesStart := gohacks.Nanotime()
 	minUnloadedInit := false
-	// With subpage saving, amfl.unloaded tracks offsets as if every page had
-	// been saved whole (so that segments split and merge as usual), and
-	// amfl.subpages maps pages to where their blocks actually are.
-	subpagesDenseOff := uint64(0)
 	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
 		if !maseg.ValuePtr().knownCommitted {
 			continue
@@ -1391,19 +1405,12 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 				minUnloadedInit = true
 				amfl.minUnloaded.Store(maFR.Start)
 			}
-			var off uint64
-			if subpages != nil {
-				off = subpagesDenseOff
-				subpagesDenseOff += amount
-			} else {
-				off = opts.PagesFileOffset
-				opts.PagesFileOffset += amount
-			}
 			amfl.pf.mu.Lock()
 			amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
-				off: off,
+				off: opts.PagesFileOffset,
 			})
 			amfl.pf.mu.Unlock()
+			opts.PagesFileOffset += amount
 			amfl.pf.lfStatus.Notify(aplLFPending)
 		} else {
 			// Verify header.
@@ -1439,6 +1446,13 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts) 
 		if !f.opts.DisableMemoryAccounting {
 			usage.MemoryAccounting.Inc(amount, maseg.ValuePtr().kind, maseg.ValuePtr().memCgID)
 		}
+	}
+	if subpages != nil {
+		// The loop above recorded offsets as if every page had been saved
+		// whole, which keeps segments of amfl.unloaded splitting and merging
+		// as usual; amfl.subpages maps pages to where their blocks actually
+		// are. The next MemoryFile starts after this one's blocks.
+		opts.PagesFileOffset = subpagesEnd
 	}
 	durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
 	if amfl != nil {
@@ -1587,8 +1601,10 @@ type asyncMemoryFileLoad struct {
 	minUnstarted uint64
 
 	// If subpages is not nil, the MemoryFile was saved with subpage saving,
-	// and aplUnloadedInfo.off is a dense offset rather than a pages file
-	// offset. subpages is immutable.
+	// and aplUnloadedInfo.off is the offset its pages would have in the pages
+	// file if they had been saved whole, which is used only to split and merge
+	// segments of unloaded; subpages gives the offsets of their saved blocks.
+	// subpages is immutable.
 	subpages *subpageLayout
 }
 

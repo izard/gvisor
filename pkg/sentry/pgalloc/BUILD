@@ -221,6 +221,7 @@ go_test(
         "//pkg/sentry/memmap",
         "//pkg/sentry/state/stateio",
         "//pkg/timing",
+        "@org_golang_google_protobuf//encoding/protowire:go_default_library",
         "@org_golang_google_protobuf//proto:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],

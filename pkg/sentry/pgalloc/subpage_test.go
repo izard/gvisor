@@ -737,93 +737,331 @@ func TestSubpageSaveRestoreSharedPagesFile(t *testing.T) {
 	}
 }
 
-// TestSubpageLoadAtRecordedOffsets loads MemoryFiles individually and in
-// reverse order, each from the metadata range and pages file offset recorded
-// when it was saved, as filesystem checkpoint restore does with the offsets in
-// its manifest.
-// opPagesReader is a dstRangeReader that records the number of MemoryFile
-// pages each read loads.
-type opPagesReader struct {
-	*dstRangeReader
-	opPages []int
-}
-
-func (r *opPagesReader) record(dstFRs []memmap.FileRange) {
-	pages := 0
-	last := uint64(math.MaxUint64)
+// readPages returns the indexes, relative to base, of the pages that dstFRs
+// lie in.
+func readPages(base uint64, dstFRs []memmap.FileRange) []uint64 {
+	var pages []uint64
 	for _, fr := range dstFRs {
 		for pg := hostarch.PageRoundDown(fr.Start); pg < fr.End; pg += hostarch.PageSize {
-			if pg != last {
-				pages++
-				last = pg
+			if i := (pg - base) / hostarch.PageSize; len(pages) == 0 || pages[len(pages)-1] != i {
+				pages = append(pages, i)
 			}
 		}
 	}
-	r.opPages = append(r.opPages, pages)
+	return pages
 }
 
-func (r *opPagesReader) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
-	r.record([]memmap.FileRange{dstFR})
-	r.dstRangeReader.AddRead(id, off, dstFile, dstFR, dstMap)
+// gatedRead is a read started by a gatedReader.
+type gatedRead struct {
+	id    int
+	pages []uint64
 }
 
-func (r *opPagesReader) AddReadv(id int, off int64, total uint64, dstFile stateio.DestinationFile, dstFRs []memmap.FileRange, dstMaps []unix.Iovec) {
-	r.record(dstFRs)
-	r.dstRangeReader.AddReadv(id, off, total, dstFile, dstFRs, dstMaps)
+// gatedReader is a dstRangeReader that reports each read it starts, and
+// completes reads only when the test releases them, until the test calls
+// setAuto.
+type gatedReader struct {
+	*dstRangeReader
+	base uint64
+
+	// pending holds the reads not yet completed. It is used only by the
+	// async page loader's goroutine.
+	pending map[int]func()
+
+	started    chan gatedRead
+	waiting    chan struct{}
+	release    chan int
+	auto       chan struct{}
+	autoClosed bool
+}
+
+func newGatedReader(t *testing.T, pages *os.File, tf *subpageTestFile, maxRanges int) *gatedReader {
+	r := &gatedReader{
+		dstRangeReader: &dstRangeReader{fd: dupFD(t, pages), maxRanges: maxRanges},
+		base:           tf.fr.Start,
+		pending:        make(map[int]func()),
+		started:        make(chan gatedRead, 4*tf.fr.Length()/hostarch.PageSize),
+		waiting:        make(chan struct{}),
+		release:        make(chan int),
+		auto:           make(chan struct{}),
+	}
+	return r
+}
+
+// setAuto makes r complete all reads without waiting for the test.
+func (r *gatedReader) setAuto() {
+	if !r.autoClosed {
+		r.autoClosed = true
+		close(r.auto)
+	}
+}
+
+// drainStarted returns the reads started since the last call, by ID.
+func (r *gatedReader) drainStarted() map[int][]uint64 {
+	reads := make(map[int][]uint64)
+	for {
+		select {
+		case read := <-r.started:
+			reads[read.id] = read.pages
+		default:
+			return reads
+		}
+	}
+}
+
+func (r *gatedReader) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
+	r.started <- gatedRead{id, readPages(r.base, []memmap.FileRange{dstFR})}
+	r.pending[id] = func() { r.dstRangeReader.AddRead(id, off, dstFile, dstFR, dstMap) }
+}
+
+func (r *gatedReader) AddReadv(id int, off int64, total uint64, dstFile stateio.DestinationFile, dstFRs []memmap.FileRange, dstMaps []unix.Iovec) {
+	r.started <- gatedRead{id, readPages(r.base, dstFRs)}
+	r.pending[id] = func() { r.dstRangeReader.AddReadv(id, off, total, dstFile, dstFRs, dstMaps) }
+}
+
+func (r *gatedReader) Wait(cs []stateio.Completion, minCompletions int) ([]stateio.Completion, error) {
+	select {
+	case r.waiting <- struct{}{}:
+	case <-r.auto:
+	}
+	for len(r.done) < minCompletions {
+		select {
+		case id := <-r.release:
+			r.pending[id]()
+			delete(r.pending, id)
+		case <-r.auto:
+			for id, read := range r.pending {
+				read()
+				delete(r.pending, id)
+			}
+		}
+	}
+	return r.dstRangeReader.Wait(cs, minCompletions)
+}
+
+func recvTimeout[T any](t *testing.T, c <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-c:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		panic("unreachable")
+	}
+}
+
+// loadSubpagesAsync loads the MemoryFile saved by saveAsync as tf from meta
+// and pages through r. It returns once every read slot is busy, with no read
+// completed; reads started until then may have started while LoadFrom was
+// still recording which pages to load.
+//
+// Cleanups registered by the caller after loadSubpagesAsync returns run
+// before loading is drained, so they must not wait for held reads.
+func loadSubpagesAsync(t *testing.T, r *gatedReader, meta *bytes.Buffer, tf *subpageTestFile) (*AsyncPagesFileLoad, *MemoryFile) {
+	t.Helper()
+	timer := timing.New("test", time.Now())
+	t.Cleanup(timer.End)
+	timeline := timer.Fork("restore")
+	t.Cleanup(timeline.End)
+	apfl, err := StartAsyncPagesFileLoad(r, nil, timeline, AsyncPagesFileLoadOpts{})
+	if err != nil {
+		t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+	}
+	// Timer.End waits for the loader's timeline, which ends only once every
+	// read completes.
+	t.Cleanup(r.setAuto)
+	restored := newTestMemoryFile(t, true /* diskBacked */)
+	t.Cleanup(restored.Destroy)
+	if err := restored.LoadFrom(context.Background(), meta, &LoadOpts{PagesFile: apfl}); err != nil {
+		apfl.MemoryFilesDone()
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	t.Cleanup(func() { restored.DecRef(tf.fr) })
+	// Finish loading before dropping references, even if the test failed
+	// while reads were held.
+	t.Cleanup(func() {
+		r.setAuto()
+		if err := restored.AwaitLoadAll(); err != nil {
+			t.Errorf("AwaitLoadAll: %v", err)
+		}
+	})
+	apfl.MemoryFilesDone()
+	recvTimeout(t, r.waiting, "the loader to wait for reads")
+	return apfl, restored
+}
+
+// repeatMasks returns pattern repeated n times.
+func repeatMasks(pattern []uint64, n int) []uint64 {
+	var masks []uint64
+	for range n {
+		masks = append(masks, pattern...)
+	}
+	return masks
 }
 
 // TestSubpageLoadBoundsPagesPerRead checks that a read of pages saved with
 // subpage saving loads no more MemoryFile bytes than the reader's per-read
 // limit, even though each page saves far fewer bytes: waiting for one page
-// then never waits for more memory than with whole-page saving.
+// then never waits for more memory than with whole-page saving. Reads are
+// still filled up to the limit as reads are reused and extended across
+// unloaded ranges.
 func TestSubpageLoadBoundsPagesPerRead(t *testing.T) {
 	for _, size := range validSubpageSizes() {
+		for _, test := range []struct {
+			name  string
+			masks []uint64
+		}{
+			{"one block per page", repeatMasks([]uint64{1}, 256)},
+			{"ranges separated by unsaved pages", repeatMasks([]uint64{1, 1, 1, 0}, 64)},
+		} {
+			t.Run(fmt.Sprintf("%d-byte blocks, %s", size, test.name), func(t *testing.T) {
+				tf := newSubpageTestFile(t, true /* diskBacked */, size, test.masks, size)
+				pages := newPagesFile(t)
+				meta := saveAsync(t, pages, tf)
+
+				r := newGatedReader(t, pages, tf, len(test.masks))
+				_, restored := loadSubpagesAsync(t, r, meta, tf)
+				first := r.drainStarted()
+				r.setAuto()
+				if err := restored.AwaitLoadAll(); err != nil {
+					t.Fatalf("AwaitLoadAll: %v", err)
+				}
+				checkSubpageContents(t, restored, tf.fr, tf.want, "restored file")
+
+				// Reads started after LoadFrom returned reuse the read slots
+				// and see all pages to load, so most are full. (The rest of an
+				// unloaded range that ends a full read is read later.)
+				var later [][]uint64
+				for len(r.started) != 0 {
+					later = append(later, (<-r.started).pages)
+				}
+				maxPages := int(r.MaxReadBytes() / hostarch.PageSize)
+				if len(later) <= r.MaxParallel() {
+					t.Fatalf("%d reads after the first %d, want more than %d", len(later), len(first), r.MaxParallel())
+				}
+				total, full := 0, 0
+				for id, pgs := range first {
+					if len(pgs) > maxPages {
+						t.Errorf("first read %d loads %d pages, limit %d", id, len(pgs), maxPages)
+					}
+					total += len(pgs)
+				}
+				for i, pgs := range later {
+					if len(pgs) > maxPages {
+						t.Errorf("read %d after the first loads %d pages, limit %d", i, len(pgs), maxPages)
+					}
+					if len(pgs) == maxPages {
+						full++
+					}
+					total += len(pgs)
+				}
+				if full <= r.MaxParallel() {
+					t.Errorf("%d of %d reads after the first load %d pages, want more than %d", full, len(later), maxPages, r.MaxParallel())
+				}
+				if total != int(tf.nonzeroPages) {
+					t.Errorf("reads load %d pages in total, want %d", total, tf.nonzeroPages)
+				}
+			})
+		}
+	}
+}
+
+// TestSubpageLoadAwaitedPageWaitsForOwnRead checks that, with every read slot
+// busy loading pages saved with subpage saving, a page waiter waits only for
+// one read to free a slot and then for a read of just its page, not for the
+// remaining reads.
+func TestSubpageLoadAwaitedPageWaitsForOwnRead(t *testing.T) {
+	for _, size := range validSubpageSizes() {
 		t.Run(fmt.Sprintf("%d-byte blocks", size), func(t *testing.T) {
-			masks := make([]uint64, 64)
-			for i := range masks {
-				masks[i] = 1
-			}
+			masks := repeatMasks([]uint64{1}, 256)
 			tf := newSubpageTestFile(t, true /* diskBacked */, size, masks, size)
 			pages := newPagesFile(t)
 			meta := saveAsync(t, pages, tf)
 
-			ar := &opPagesReader{dstRangeReader: &dstRangeReader{fd: dupFD(t, pages), maxRanges: len(masks)}}
-			timer := timing.New("test", time.Now())
-			t.Cleanup(timer.End)
-			timeline := timer.Fork("restore")
-			t.Cleanup(timeline.End)
-			apfl, err := StartAsyncPagesFileLoad(ar, nil, timeline, AsyncPagesFileLoadOpts{})
-			if err != nil {
-				t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+			r := newGatedReader(t, pages, tf, len(masks))
+			apfl, restored := loadSubpagesAsync(t, r, meta, tf)
+			inflight := r.drainStarted()
+			if len(inflight) != r.MaxParallel() {
+				t.Fatalf("%d reads started, want %d", len(inflight), r.MaxParallel())
 			}
-			restored := newTestMemoryFile(t, true /* diskBacked */)
-			t.Cleanup(restored.Destroy)
-			if err := restored.LoadFrom(context.Background(), meta, &LoadOpts{PagesFile: apfl}); err != nil {
-				apfl.MemoryFilesDone()
-				t.Fatalf("LoadFrom: %v", err)
+			const page = 255
+			for id, pgs := range inflight {
+				if slices.Contains(pgs, page) {
+					t.Fatalf("awaited page %d is already in read %d of %d pages", page, id, len(pgs))
+				}
 			}
-			t.Cleanup(func() { restored.DecRef(tf.fr) })
-			apfl.MemoryFilesDone()
+
+			amfl := restored.asyncPageLoad.Load()
+			fr := memmap.FileRange{tf.fr.Start + page*hostarch.PageSize, tf.fr.Start + (page+1)*hostarch.PageSize}
+			restored.IncRef(fr, 0)
+			t.Cleanup(func() { restored.DecRef(fr) })
+			woke := make(chan error, 1)
+			exited := make(chan struct{})
+			go func() {
+				defer close(exited)
+				woke <- amfl.awaitLoad(fr)
+			}()
+			// Let the waiter finish before its page reference is dropped.
+			t.Cleanup(func() {
+				r.setAuto()
+				<-exited
+			})
+			for deadline := time.Now().Add(10 * time.Second); ; {
+				apfl.mu.Lock()
+				registered := apfl.totalWaiters == 1
+				apfl.mu.Unlock()
+				if registered {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("waiter for page %d did not register", page)
+				}
+				time.Sleep(time.Millisecond)
+			}
+
+			// Free one slot: the loader must use it to read just the awaited
+			// page.
+			for id := range inflight {
+				r.release <- id
+				delete(inflight, id)
+				break
+			}
+			recvTimeout(t, r.waiting, "the loader to wait for reads")
+			next := r.drainStarted()
+			if len(next) != 1 {
+				t.Fatalf("%d reads started after one completed, want 1: %v", len(next), next)
+			}
+			for id, pgs := range next {
+				if !slices.Equal(pgs, []uint64{page}) {
+					t.Fatalf("read started for awaited page %d loads pages %v", page, pgs)
+				}
+				select {
+				case err := <-woke:
+					t.Fatalf("waiter woke (%v) before its read completed", err)
+				default:
+				}
+				r.release <- id
+			}
+			// The waiter wakes while the other len(inflight) reads are still
+			// held.
+			if err := recvTimeout(t, woke, "the waiter to wake"); err != nil {
+				t.Fatalf("awaitLoad: %v", err)
+			}
+			checkSubpageContents(t, restored, fr, tf.want[page*hostarch.PageSize:(page+1)*hostarch.PageSize], "awaited page")
+
+			r.setAuto()
 			if err := restored.AwaitLoadAll(); err != nil {
 				t.Fatalf("AwaitLoadAll: %v", err)
 			}
 			checkSubpageContents(t, restored, tf.fr, tf.want, "restored file")
-
-			maxPages := int(ar.MaxReadBytes() / hostarch.PageSize)
-			total := 0
-			for i, n := range ar.opPages {
-				if n > maxPages {
-					t.Errorf("read %d loads %d pages, limit %d", i, n, maxPages)
-				}
-				total += n
-			}
-			if total != len(masks) {
-				t.Errorf("reads load %d pages in total, want %d", total, len(masks))
-			}
 		})
 	}
 }
 
+// TestSubpageLoadAtRecordedOffsets loads MemoryFiles individually and in
+// reverse order, each from the metadata range and pages file offset recorded
+// when it was saved, as filesystem checkpoint restore does with the offsets in
+// its manifest.
 func TestSubpageLoadAtRecordedOffsets(t *testing.T) {
 	size := validSubpageSizes()[0]
 	masks := subpageTestMasks(size)

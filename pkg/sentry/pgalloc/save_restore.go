@@ -1676,6 +1676,9 @@ type aplOp struct {
 	// loaded, of which frs are the saved blocks.
 	pages []memmap.FileRange
 
+	// pagesBytes is the total length of pages.
+	pagesBytes uint64
+
 	// If tempRef is true, a temporary reference is held on pages in
 	// loaded() that should be dropped after completion.
 	tempRef bool
@@ -1886,6 +1889,7 @@ func (apfl *AsyncPagesFileLoad) enqueueRange(amfl *asyncMemoryFileLoad, fr memma
 			op.frs = op.frs[:0]
 			op.iovecs = op.iovecs[:0]
 			op.pages = op.pages[:0]
+			op.pagesBytes = 0
 			apfl.curOp = op
 			apfl.curOpID = id
 		}
@@ -2025,6 +2029,13 @@ func (apfl *AsyncPagesFileLoad) combineSubpages(amfl *asyncMemoryFileLoad, fr me
 		if op.total+size > apfl.maxReadBytes {
 			break
 		}
+		// Also bound the MemoryFile bytes that op loads, as whole-page reads
+		// are bounded. A waiter for any of op's pages waits for all of op, and
+		// bounding only the bytes read would let op load up to
+		// hostarch.PageSize/sp.size times as much memory.
+		if op.pagesBytes+hostarch.PageSize > apfl.maxReadBytes {
+			break
+		}
 		// Map each run of saved blocks (which lies within a single chunk), and
 		// check that the page's ranges and iovecs fit before adding any of
 		// them. LoadFrom ensures that a page always fits in an empty op.
@@ -2070,6 +2081,7 @@ func (apfl *AsyncPagesFileLoad) combineSubpages(amfl *asyncMemoryFileLoad, fr me
 		op.total += size
 		op.end += size
 		added += hostarch.PageSize
+		op.pagesBytes += hostarch.PageSize
 	}
 	return added
 }

@@ -741,6 +741,89 @@ func TestSubpageSaveRestoreSharedPagesFile(t *testing.T) {
 // reverse order, each from the metadata range and pages file offset recorded
 // when it was saved, as filesystem checkpoint restore does with the offsets in
 // its manifest.
+// opPagesReader is a dstRangeReader that records the number of MemoryFile
+// pages each read loads.
+type opPagesReader struct {
+	*dstRangeReader
+	opPages []int
+}
+
+func (r *opPagesReader) record(dstFRs []memmap.FileRange) {
+	pages := 0
+	last := uint64(math.MaxUint64)
+	for _, fr := range dstFRs {
+		for pg := hostarch.PageRoundDown(fr.Start); pg < fr.End; pg += hostarch.PageSize {
+			if pg != last {
+				pages++
+				last = pg
+			}
+		}
+	}
+	r.opPages = append(r.opPages, pages)
+}
+
+func (r *opPagesReader) AddRead(id int, off int64, dstFile stateio.DestinationFile, dstFR memmap.FileRange, dstMap []byte) {
+	r.record([]memmap.FileRange{dstFR})
+	r.dstRangeReader.AddRead(id, off, dstFile, dstFR, dstMap)
+}
+
+func (r *opPagesReader) AddReadv(id int, off int64, total uint64, dstFile stateio.DestinationFile, dstFRs []memmap.FileRange, dstMaps []unix.Iovec) {
+	r.record(dstFRs)
+	r.dstRangeReader.AddReadv(id, off, total, dstFile, dstFRs, dstMaps)
+}
+
+// TestSubpageLoadBoundsPagesPerRead checks that a read of pages saved with
+// subpage saving loads no more MemoryFile bytes than the reader's per-read
+// limit, even though each page saves far fewer bytes: waiting for one page
+// then never waits for more memory than with whole-page saving.
+func TestSubpageLoadBoundsPagesPerRead(t *testing.T) {
+	for _, size := range validSubpageSizes() {
+		t.Run(fmt.Sprintf("%d-byte blocks", size), func(t *testing.T) {
+			masks := make([]uint64, 64)
+			for i := range masks {
+				masks[i] = 1
+			}
+			tf := newSubpageTestFile(t, true /* diskBacked */, size, masks, size)
+			pages := newPagesFile(t)
+			meta := saveAsync(t, pages, tf)
+
+			ar := &opPagesReader{dstRangeReader: &dstRangeReader{fd: dupFD(t, pages), maxRanges: len(masks)}}
+			timer := timing.New("test", time.Now())
+			t.Cleanup(timer.End)
+			timeline := timer.Fork("restore")
+			t.Cleanup(timeline.End)
+			apfl, err := StartAsyncPagesFileLoad(ar, nil, timeline, AsyncPagesFileLoadOpts{})
+			if err != nil {
+				t.Fatalf("StartAsyncPagesFileLoad: %v", err)
+			}
+			restored := newTestMemoryFile(t, true /* diskBacked */)
+			t.Cleanup(restored.Destroy)
+			if err := restored.LoadFrom(context.Background(), meta, &LoadOpts{PagesFile: apfl}); err != nil {
+				apfl.MemoryFilesDone()
+				t.Fatalf("LoadFrom: %v", err)
+			}
+			t.Cleanup(func() { restored.DecRef(tf.fr) })
+			apfl.MemoryFilesDone()
+			if err := restored.AwaitLoadAll(); err != nil {
+				t.Fatalf("AwaitLoadAll: %v", err)
+			}
+			checkSubpageContents(t, restored, tf.fr, tf.want, "restored file")
+
+			maxPages := int(ar.MaxReadBytes() / hostarch.PageSize)
+			total := 0
+			for i, n := range ar.opPages {
+				if n > maxPages {
+					t.Errorf("read %d loads %d pages, limit %d", i, n, maxPages)
+				}
+				total += n
+			}
+			if total != len(masks) {
+				t.Errorf("reads load %d pages in total, want %d", total, len(masks))
+			}
+		})
+	}
+}
+
 func TestSubpageLoadAtRecordedOffsets(t *testing.T) {
 	size := validSubpageSizes()[0]
 	masks := subpageTestMasks(size)
